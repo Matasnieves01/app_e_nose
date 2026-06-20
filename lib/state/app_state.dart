@@ -52,8 +52,8 @@ class AppState extends ChangeNotifier {
   /// Segundos de preparacion (calentamiento) antes de empezar a detectar.
   static const int prepSeconds = 10;
 
-  /// Duracion de la deteccion antes de parar automaticamente.
-  static const int measureSeconds = 20;
+  /// Duracion de la deteccion (exhalacion) antes de parar automaticamente.
+  static const int measureSeconds = 9;
 
   MeasureState _measureState = MeasureState.idle;
   MeasureState get measureState => _measureState;
@@ -153,11 +153,12 @@ class AppState extends ChangeNotifier {
       _countdown--;
       if (_countdown <= 0) {
         if (_measureState == MeasureState.preparing) {
-          // Termino la preparacion -> empieza a detectar.
+          // Termino la preparacion -> avisa al UNO Q que empiece a recolectar.
           _measureState = MeasureState.measuring;
           _countdown = measureSeconds;
+          _net.sendCommand('MEASURE');
         } else {
-          // Termino la deteccion -> para sola.
+          // Termino la deteccion -> para sola (el UNO Q calcula la media).
           stopMeasurement();
           return;
         }

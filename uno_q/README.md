@@ -29,7 +29,21 @@ python3 wifi_host.py        # debe decir: servidor TCP escuchando en 0.0.0.0:876
 **3. En el teléfono** (misma WiFi): IP del UNO Q (`hostname -I` → la 192.168.x.x),
 puerto 8765 → Conectar → **Iniciar medición**.
 - Durante "Preparando" **no exhales** (captura tu base de aire limpio).
-- Exhala en "Detectando".
+- Exhala en "Detectando" (~9 s).
+
+## Cómo calcula la medida (algoritmo)
+
+1. **START** (Preparando): promedia el aire limpio → base de calibración de la sesión.
+2. **MEASURE** (Detectando, ~9 s): recolecta todas las lecturas mientras exhalas
+   (no infiere por lectura).
+3. **STOP**: **recorta** las primeras y últimas lecturas (outliers de
+   estabilización/agotamiento), **promedia** el centro, e **infiere una sola
+   vez** sobre esa media → diagnóstico final (el valor más probable).
+
+> **Para que el promedio sea bueno necesitas más muestras en esos 9 s.** Reduce
+> el `delay()` del loop en tu `sketch.ino` (p. ej. de 2000 ms a ~400-500 ms) para
+> tener ~18-22 lecturas por medición. Con pocas muestras el recorte deja muy poco.
+> Ajusta `RECORTE` en `inferir.py` si quieres recortar más/menos.
 
 ## Flujo
 ```
