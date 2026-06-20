@@ -35,12 +35,16 @@ DATASET = {
 # ---- Estadisticos de TUS sensores (medir con estimar_calibracion.py) ----
 # Valores iniciales APROXIMADOS sacados de tu salida serial. RECALIBRA con tus
 # propias mediciones (ver estimar_calibracion.py) para que sea correcto.
+# NOTA: con la auto-base por sesion, la 'mean' la calcula sola cada medicion;
+# aqui SOLO importa la 'std' (controla la SENSIBILIDAD del mapeo). std mas grande
+# = menos sensible a la deriva del sensor = lecturas mas estables y consistentes.
+# (std chicas amplificaban la deriva y hacian saltar el BGL de 95 a 200.)
 USUARIO = {
-    "CO":      {"mean": 27.5, "std": 1.6},
-    "Alcohol": {"mean": 54.0, "std": 5.5},
-    "Acetone": {"mean": 3.6,  "std": 0.35},
+    "CO":      {"mean": 27.5, "std": 3.5},
+    "Alcohol": {"mean": 54.0, "std": 15.0},
+    "Acetone": {"mean": 3.6,  "std": 0.8},
     # CO_7 = misma lectura cruda del MQ-7, asi que usa los mismos stats que CO.
-    "CO_7":    {"mean": 27.5, "std": 1.6},
+    "CO_7":    {"mean": 27.5, "std": 3.5},
 }
 
 

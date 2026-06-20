@@ -153,11 +153,12 @@ class AppState extends ChangeNotifier {
       _countdown--;
       if (_countdown <= 0) {
         if (_measureState == MeasureState.preparing) {
-          // Termino la preparacion -> empieza a detectar.
+          // Fin de la calibracion -> avisa al UNO Q que empiece a recolectar.
           _measureState = MeasureState.measuring;
           _countdown = measureSeconds;
+          _net.sendCommand('MEASURE');
         } else {
-          // Termino la deteccion -> para sola.
+          // Fin de la recoleccion -> para sola (el UNO Q limpia y estima).
           stopMeasurement();
           return;
         }

@@ -1,60 +1,56 @@
-"""inferir() con CALIBRACION aplicada.
+"""E-Nose · inferencia en el UNO Q (lado contenedor de App Lab).
 
-Igual que tu version, pero antes de pasar las lecturas al modelo las mapea al
-espacio del dataset con calibracion.calibrar(). Asi dejan de caer fuera de
-rango y el modelo deja de saturar en "diabetico".
+Dos fases por sesion (la app manda los comandos por WiFi -> command.txt):
 
-Pasos para que funcione bien:
-  1. Junta una tanda de lecturas crudas de tus sensores (aire limpio + varias
-     exhalaciones) y estima tus stats:  python3 estimar_calibracion.py --csv ...
-  2. Pega el bloque USUARIO que te imprime en calibracion.py.
-  3. Corre este inferir().
+  FASE 1 - CALIBRACION (START, "Preparando", NO exhalar):
+      Recolecta lecturas de aire limpio y promedia -> base de calibracion de
+      esta sesion (robusto a la deriva del Ro entre arranques).
+
+  FASE 2 - RECOLECCION PARA EL MODELO (MEASURE, "Detectando", 20 s, EXHALAS):
+      Recolecta TODAS las lecturas mientras exhalas (no infiere por lectura).
+
+  FINAL (STOP): limpieza + estimacion
+      1) Limpieza: descarta las lecturas INICIALES y FINALES (estabilizacion del
+         flujo y agotamiento de la exhalacion) -> quita outliers.
+      2) Media: promedio del subconjunto central limpio.
+      3) Estimacion: una sola inferencia sobre esa media -> niveles de glucosa.
+
+Escribe el resultado en result.json (lo sirve wifi_host.py por WiFi).
 """
 import json
 import os
-from collections import deque
 
 import joblib
 import pandas as pd
+
 from arduino.app_utils import App, Bridge
 
 from calibracion import calibrar
 from compensacion import compensar
 
 # --- Puente con el host por archivos compartidos ---
-# El contenedor de App Lab esta aislado de la red local (NAT), asi que el
-# servidor WiFi corre en el HOST (wifi_host.py). Este proceso (contenedor)
-# escribe el resultado en result.json y lee los comandos START/STOP de
-# command.txt. La carpeta es compartida (bind mount), por eso funciona.
 _HERE = os.path.dirname(os.path.abspath(__file__))
 RESULT_FILE = os.path.join(_HERE, "result.json")
 CMD_FILE = os.path.join(_HERE, "command.txt")
 
-_midiendo = False
+MODELS_DIR = "python/models"
+FEATURES = ["CO", "Alcohol", "Acetone", "CO_7"]
 
-# --- Calibracion por sesion (auto-base) ---
-# El Ro de los MQ cambia entre arranques, asi que la base se mueve. Solucion:
-# al iniciar cada medicion (START), las primeras N lecturas (aire limpio, antes
-# de exhalar) definen la base de ESA sesion. Todo se mide relativo a esa base.
-N_BASE = 5
-_base_buf: list = []          # lecturas crudas para armar la base
-_medias_sesion = None         # {"CO":.., "Alcohol":.., "Acetone":..} o None
+# Guard de humedad: si esta en True, descarta lecturas con humedad/temp altas.
+# Por ahora DESACTIVADO -> se dan valores aunque la humedad este alta.
+FILTRAR_HUMEDAD = False
+HUM_MAX = 85.0   # %
+TEMP_MAX = 40.0  # °C
 
+# Limpieza: fraccion de lecturas a descartar de CADA extremo (inicio y fin).
+FRAC_RECORTE = 0.20   # 20% al inicio + 20% al final
+MIN_RECORTE = 1       # al menos 1 de cada lado si hay suficientes
 
-def _check_command() -> None:
-    """Lee command.txt (lo escribe wifi_host cuando la app manda START/STOP)."""
-    global _midiendo, _base_buf, _medias_sesion
-    try:
-        with open(CMD_FILE) as f:
-            nuevo = f.read().strip().upper() == "START"
-    except FileNotFoundError:
-        return
-    # Flanco de subida (arranca una medicion nueva): reinicia la base de sesion.
-    if nuevo and not _midiendo:
-        _base_buf = []
-        _medias_sesion = None
-        print("[sesion] START - capturando base...")
-    _midiendo = nuevo
+# --- Estado de la sesion ---
+_fase = "idle"          # idle | calibrando | midiendo
+_base_buf = []          # FASE 1: lecturas de aire limpio (calibracion)
+_medir_buf = []         # FASE 2: lecturas durante la exhalacion (modelo)
+_medias_sesion = None    # base de calibracion calculada
 
 
 def _publicar(obj: dict) -> None:
@@ -68,38 +64,6 @@ def _publicar(obj: dict) -> None:
         print(f"[publicar] error: {e}")
 
 
-MODELS_DIR = "python/models"
-FEATURES = ["CO", "Alcohol", "Acetone", "CO_7"]
-
-# Guard: la HUMEDAD es el confounder real. A ~85% los MQ aun NO condensan, asi
-# que con la compensacion bien medida ese rango es utilizable. Por encima de 88%
-# ya hay riesgo de condensacion -> se rechaza.
-# IMPORTANTE: este umbral alto SOLO es seguro si mediste los coeficientes de
-# compensacion (estimar_compensacion.py). Sin medirlos, la humedad arrastra la
-# clasificacion a falso diabetico -> en ese caso baja HUM_MAX a 70.
-HUM_MAX = 85.0   # % humedad relativa
-TEMP_MAX = 40.0  # °C (solo tope de seguridad; ambiente normal pasa)
-
-# Suavizado: promedia las ultimas N lecturas crudas para que el jitter/deriva
-# del sensor no haga saltar la clasificacion lectura a lectura.
-VENTANA = 5
-_buffer = deque(maxlen=VENTANA)
-
-# Ultimo resultado VALIDO (antes de saturar). Al exhalar, la humedad sube y el
-# pico satura; guardamos el resultado de la ventana valida del aliento para
-# mostrarlo en vez de solo "no valida".
-_ultimo_valido = None
-
-
-def _suavizar(co: float, alcohol: float, acetone: float) -> tuple:
-    _buffer.append((co, alcohol, acetone))
-    n = len(_buffer)
-    return (
-        sum(v[0] for v in _buffer) / n,
-        sum(v[1] for v in _buffer) / n,
-        sum(v[2] for v in _buffer) / n,
-    )
-
 print("Cargando modelos...")
 scaler = joblib.load(f"{MODELS_DIR}/nb1_scaler_clasificacion.pkl")
 clf = joblib.load(f"{MODELS_DIR}/nb1_modelo_clasificacion.pkl")
@@ -107,124 +71,138 @@ reg = joblib.load(f"{MODELS_DIR}/nb2_modelo_regresion.pkl")
 print(f"✓ {type(scaler).__name__} | {type(clf).__name__} | {type(reg).__name__}")
 
 
-def inferir(payload: str) -> str:
-    global _ultimo_valido, _medias_sesion
+def _check_command() -> None:
+    """Lee command.txt y cambia de fase (START / MEASURE / STOP)."""
+    global _fase, _base_buf, _medir_buf, _medias_sesion
     try:
-        # Revisa si la app pidio START/STOP (via wifi_host -> command.txt).
-        _check_command()
+        with open(CMD_FILE) as f:
+            cmd = f.read().strip().upper()
+    except FileNotFoundError:
+        return
 
-        # Solo detecta cuando la app inicio la medicion (START). En espera, no
-        # procesa ni publica (evita lecturas fuera de sesion).
-        if not _midiendo:
+    if cmd == "START" and _fase == "idle":
+        _fase = "calibrando"
+        _base_buf = []
+        _medir_buf = []
+        _medias_sesion = None
+        print("[sesion] START - FASE 1 calibracion (NO exhalar)")
+    elif cmd == "MEASURE" and _fase == "calibrando":
+        _calcular_base()
+        _fase = "midiendo"
+        print("[sesion] MEASURE - FASE 2 recoleccion (exhala ahora)")
+    elif cmd == "STOP" and _fase != "idle":
+        _finalizar()
+        _fase = "idle"
+
+
+def _calcular_base() -> None:
+    """FASE 1: promedio del aire limpio -> base de calibracion de la sesion."""
+    global _medias_sesion
+    if not _base_buf:
+        _medias_sesion = None
+        print("[base] sin lecturas de calibracion")
+        return
+    k = len(_base_buf)
+    _medias_sesion = {
+        "CO": sum(b[0] for b in _base_buf) / k,
+        "Alcohol": sum(b[1] for b in _base_buf) / k,
+        "Acetone": sum(b[2] for b in _base_buf) / k,
+    }
+    print(f"[base] calibracion lista ({k} lecturas): {_medias_sesion}")
+
+
+def _limpiar(buf: list) -> list:
+    """Limpieza: descarta las lecturas iniciales y finales (outliers)."""
+    n = len(buf)
+    r = max(MIN_RECORTE, int(n * FRAC_RECORTE))
+    if n > 2 * r:
+        return buf[r:n - r]
+    if n >= 3:
+        return buf[1:-1]
+    return buf
+
+
+def _finalizar() -> None:
+    """Limpieza + media + UNA estimacion sobre los datos limpios."""
+    if len(_medir_buf) < 2 or _medias_sesion is None:
+        print("[FINAL] muestras insuficientes")
+        _publicar({"valida": False, "motivo": "insuficiente"})
+        return
+
+    limpio = _limpiar(_medir_buf)
+    k = len(limpio)
+    co_m = sum(b[0] for b in limpio) / k
+    alc_m = sum(b[1] for b in limpio) / k
+    ace_m = sum(b[2] for b in limpio) / k
+
+    # Una sola estimacion sobre la media limpia.
+    cal = calibrar(co_m, alc_m, ace_m, medias=_medias_sesion)
+    muestra = pd.DataFrame([cal])[FEATURES]
+    muestra_scaled = pd.DataFrame(scaler.transform(muestra), columns=FEATURES)
+    clase = int(clf.predict(muestra_scaled)[0])
+    proba = clf.predict_proba(muestra_scaled)[0]
+    bgl = float(reg.predict(muestra_scaled)[0])
+
+    print("=" * 50)
+    print(f"[FINAL] recolectadas={len(_medir_buf)}  limpias(centro)={k}")
+    print(f"  media  CO={co_m:.2f}  Alc={alc_m:.2f}  Ace={ace_m:.2f}")
+    print(f"  Clasificacion : {'DM — Diabetico' if clase == 1 else 'HI — Sano'}")
+    print(f"  P(DM)         : {proba[1]:.3f}")
+    print(f"  BGL estimado  : {bgl:.1f} mg/dL  (media de {k} lecturas limpias)")
+    print("=" * 50)
+
+    _publicar({
+        "valida": True,
+        "final": True,
+        "co": round(co_m, 2),
+        "alcohol": round(alc_m, 2),
+        "acetone": round(ace_m, 2),
+        "glucose": round(bgl, 1),
+        "diabetes": 1 if clase == 1 else 0,
+        "prob": round(float(proba[1]), 3),
+        "muestras": len(_medir_buf),
+        "limpias": k,
+    })
+
+
+def inferir(payload: str) -> str:
+    try:
+        _check_command()
+        if _fase == "idle":
             return json.dumps({"midiendo": False})
 
         d = json.loads(payload)
-
-        # Lecturas crudas de tus sensores (Rs/Ro).
         co_raw = float(d["rs_ro_7"])
         alcohol_raw = float(d["rs_ro_3"])
         acetone_raw = float(d["rs_ro_135"])
         hum = float(d.get("hum", 0))
         temp = float(d.get("temp", 0))
 
-        # GUARD: si hay exceso de humedad (o temp fuera del tope), la lectura no
-        # sirve. Mejor avisar que reportar un falso positivo.
-        if hum > HUM_MAX or temp > TEMP_MAX:
-            motivo = "humedad_alta" if hum > HUM_MAX else "temperatura_alta"
-            print("─" * 50)
-            print(f"  ⚠ SATURADO ({motivo}) — humedad {hum}% / temp {temp}°C")
-            if _ultimo_valido:
-                print(f"  Mostrando ultimo resultado valido del aliento:")
-                print(f"  → {_ultimo_valido['clase']} | BGL {_ultimo_valido['bgl']} mg/dL")
-            else:
-                print("  Aun sin resultado valido. Exhala mas suave o seca la muestra.")
-            print("─" * 50)
-            # Notifica a la app: lectura no valida + el ultimo resultado valido.
-            app_msg = {"valida": False, "motivo": motivo, "hum": hum, "temp": temp}
-            if _ultimo_valido:
-                app_msg.update({
-                    "glucose": _ultimo_valido["bgl"],
-                    "diabetes": 1 if _ultimo_valido["clase"] == "DM" else 0,
-                    "prob": _ultimo_valido["p_dm"],
-                })
-            _publicar(app_msg)
-            return json.dumps({
-                "valida": False,
-                "motivo": motivo,
-                "hum": hum,
-                "temp": temp,
-                "ultimo": _ultimo_valido,  # resultado de la ventana valida
-            })
+        # GUARD de humedad (DESACTIVADO por ahora). Si se reactiva, descarta las
+        # lecturas saturadas de vapor para que no entren al promedio.
+        if FILTRAR_HUMEDAD and (hum > HUM_MAX or temp > TEMP_MAX):
+            print(f"  ⚠ saturado (hum {hum}% / temp {temp}°C) - descartada")
+            _publicar({"valida": False, "motivo": "humedad_alta",
+                       "hum": hum, "temp": temp, "fase": _fase})
+            return json.dumps({"saturado": True})
 
-        # 1) COMPENSACION: quita el efecto de humedad/temperatura usando el DHT22.
+        # Compensacion de humedad/temperatura.
         co_c, alcohol_c, acetone_c = compensar(
             co_raw, alcohol_raw, acetone_raw, temp=temp, hum=hum)
 
-        # 2) SUAVIZADO: promedio movil para que el jitter no salte.
-        co_s, alcohol_s, acetone_s = _suavizar(co_c, alcohol_c, acetone_c)
+        if _fase == "calibrando":
+            _base_buf.append((co_c, alcohol_c, acetone_c))
+            print(f"[calibracion] n={len(_base_buf)}")
+            _publicar({"valida": False, "motivo": "preparando", "n": len(_base_buf)})
+            return json.dumps({"preparando": True, "n": len(_base_buf)})
 
-        # AUTO-BASE: las primeras N lecturas de la sesion (aire limpio, antes de
-        # exhalar) definen la base, ya compensada y suavizada. Todo se calibra
-        # relativo a ella -> robusto a la deriva del Ro entre arranques.
-        if _medias_sesion is None:
-            _base_buf.append((co_s, alcohol_s, acetone_s))
-            faltan = N_BASE - len(_base_buf)
-            if faltan > 0:
-                print(f"[base] capturando... faltan {faltan}")
-                _publicar({"valida": False, "motivo": "preparando", "faltan": faltan})
-                return json.dumps({"preparando": True, "faltan": faltan})
-            k = len(_base_buf)
-            _medias_sesion = {
-                "CO": sum(b[0] for b in _base_buf) / k,
-                "Alcohol": sum(b[1] for b in _base_buf) / k,
-                "Acetone": sum(b[2] for b in _base_buf) / k,
-            }
-            print(f"[base] lista: {_medias_sesion}")
-
-        # 3) CALIBRACION relativa a la base de la sesion (auto-ajustada).
-        cal = calibrar(co_s, alcohol_s, acetone_s, medias=_medias_sesion)
-
-        muestra = pd.DataFrame([cal])[FEATURES]
-        muestra_scaled = pd.DataFrame(scaler.transform(muestra), columns=FEATURES)
-
-        clase = clf.predict(muestra_scaled)[0]
-        proba = clf.predict_proba(muestra_scaled)[0]
-        bgl = reg.predict(muestra_scaled)[0]
-
-        resultado = {
-            "valida": True,
-            "clase": "DM" if clase == 1 else "HI",
-            "p_hi": round(float(proba[0]), 3),
-            "p_dm": round(float(proba[1]), 3),
-            "bgl": round(float(bgl), 1),
-        }
-        _ultimo_valido = resultado  # se retiene si luego satura el aliento
-
-        print("─" * 50)
-        print(f"  CRUDO   CO={co_raw:.2f}  Alc={alcohol_raw:.2f}  Ace={acetone_raw:.2f}")
-        print(f"  CALIBR  CO={cal['CO']:.2f}  Alc={cal['Alcohol']:.2f}  "
-              f"Ace={cal['Acetone']:.2f}  CO_7={cal['CO_7']:.2f}")
-        print(f"  Temp {d.get('temp','?')} °C | Humedad {d.get('hum','?')} %")
-        print(f"  Clasificación : {'DM — Diabético' if clase == 1 else 'HI — Sano'}")
-        print(f"  P(HI — Sano)  : {resultado['p_hi']}")
-        print(f"  P(DM — Diab.) : {resultado['p_dm']}")
-        print(f"  BGL estimado  : {resultado['bgl']} mg/dL")
-        print("─" * 50)
-
-        # Publica el resultado para el host BLE (contrato de la app).
-        _publicar({
-            "valida": True,
-            "co": round(co_raw, 2),
-            "alcohol": round(alcohol_raw, 2),
-            "acetone": round(acetone_raw, 2),
-            "glucose": resultado["bgl"],
-            "diabetes": 1 if clase == 1 else 0,
-            "prob": resultado["p_dm"],
-            "hum": hum,
-            "temp": temp,
-        })
-
-        return json.dumps(resultado)
+        # FASE 2 (midiendo): solo recolecta para el modelo (no infiere por lectura).
+        _medir_buf.append((co_c, alcohol_c, acetone_c))
+        print(f"[recoleccion] n={len(_medir_buf)}  CO={co_c:.2f} Alc={alcohol_c:.2f} "
+              f"Ace={acetone_c:.2f} hum={hum}%")
+        _publicar({"valida": False, "motivo": "midiendo",
+                   "n": len(_medir_buf), "hum": hum})
+        return json.dumps({"midiendo": True, "n": len(_medir_buf)})
 
     except Exception as e:
         print(f"[error] {e}")

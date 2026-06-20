@@ -37,7 +37,7 @@ async def handle_client(reader, writer):
             if not line:
                 break
             cmd = line.decode("utf-8", "ignore").strip().upper()
-            if cmd in ("START", "STOP"):
+            if cmd in ("START", "MEASURE", "STOP"):
                 with open(CMD_FILE, "w") as f:
                     f.write(cmd)
                 print(f"[wifi] comando recibido: {cmd}")
